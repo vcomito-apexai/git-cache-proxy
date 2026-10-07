@@ -178,9 +178,15 @@ impl GitCache {
                 Some(t) => self.cfg.fetch_ttl.is_zero() || t.elapsed() >= self.cfg.fetch_ttl,
             };
             if stale {
-                self.fetch(repo).await?;
-                *last = Some(Instant::now());
-                return Ok(CacheOutcome::Fetched);
+                match self.fetch(repo).await {
+                    Ok(()) => {
+                        *last = Some(Instant::now());
+                        return Ok(CacheOutcome::Fetched);
+                    }
+                    Err(error) => {
+                        tracing::warn!(repo = %repo.name, error = %error, "upstream fetch failed; serving cached mirror");
+                    }
+                }
             }
         }
         Ok(CacheOutcome::Cached)
@@ -267,13 +273,16 @@ impl GitCache {
                     tracing::warn!(repo = %name, "git upload-pack exited: {s}")
                 }
                 Err(e) => tracing::warn!(repo = %name, "git upload-pack wait failed: {e}"),
-                _ => {}
+                Ok(_) => tracing::info!(repo = %name, "git upload-pack exited successfully"),
             }
         });
         let timed = TimedReader {
             inner: stdout,
             repo: repo.name.clone(),
             recorder: Some((self.metrics.clone(), started)),
+            completed: false,
+            bytes_read: 0,
+            last_progress: Instant::now(),
         };
         Ok(ReaderStream::new(timed))
     }
@@ -546,7 +555,8 @@ fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Wraps `upload-pack`'s stdout to record how long the packfile took to serve.
+/// Wraps `upload-pack`'s stdout to record how long the packfile took to serve and
+/// whether the response stream completed or was interrupted.
 /// The duration spans from the RPC starting to the stream reaching EOF - or the
 /// client disconnecting, caught by `Drop` - so it includes the client's read
 /// speed: this is serve latency, not pure generation time. Recorded exactly once
@@ -555,10 +565,13 @@ pub struct TimedReader<R> {
     inner: R,
     repo: String,
     recorder: Option<(Arc<Metrics>, Instant)>,
+    completed: bool,
+    bytes_read: u64,
+    last_progress: Instant,
 }
 
 impl<R> TimedReader<R> {
-    fn record(&mut self) {
+    fn finish(&mut self) {
         if let Some((metrics, started)) = self.recorder.take() {
             metrics.observe_serve(
                 ServeKind::UploadPack,
@@ -578,11 +591,39 @@ impl<R: AsyncRead + Unpin> AsyncRead for TimedReader<R> {
         let this = self.get_mut();
         let before = buf.filled().len();
         let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
-        // A ready read that produced no bytes is EOF: the packfile is fully served.
-        if let Poll::Ready(Ok(())) = &poll
-            && buf.filled().len() == before
-        {
-            this.record();
+        let bytes_read = buf.filled().len() - before;
+        if bytes_read > 0 {
+            this.bytes_read += bytes_read as u64;
+            if this.last_progress.elapsed() >= Duration::from_secs(10) {
+                tracing::info!(
+                    repo = %this.repo,
+                    bytes = this.bytes_read,
+                    "client upload-pack progress"
+                );
+                this.last_progress = Instant::now();
+            }
+        }
+        match &poll {
+            Poll::Ready(Ok(())) if buf.filled().len() == before => {
+                tracing::info!(
+                    repo = %this.repo,
+                    bytes = this.bytes_read,
+                    "client upload-pack response completed"
+                );
+                this.completed = true;
+                this.finish();
+            }
+            Poll::Ready(Err(error)) => {
+                tracing::warn!(
+                    repo = %this.repo,
+                    bytes = this.bytes_read,
+                    error = %error,
+                    "client upload-pack response failed"
+                );
+                this.completed = true;
+                this.finish();
+            }
+            _ => {}
         }
         poll
     }
@@ -590,8 +631,14 @@ impl<R: AsyncRead + Unpin> AsyncRead for TimedReader<R> {
 
 impl<R> Drop for TimedReader<R> {
     fn drop(&mut self) {
-        // Covers a client that hung up before EOF; a no-op if EOF already recorded.
-        self.record();
+        if !self.completed {
+            tracing::warn!(
+                repo = %self.repo,
+                bytes = self.bytes_read,
+                "client upload-pack response interrupted"
+            );
+            self.finish();
+        }
     }
 }
 
@@ -726,6 +773,9 @@ mod tests {
             inner: &b"packfile bytes"[..],
             repo: "group/foo.git".into(),
             recorder: Some((metrics.clone(), Instant::now())),
+            completed: false,
+            bytes_read: 0,
+            last_progress: Instant::now(),
         };
         // Reading to EOF drives the final zero-byte read, which records once.
         let mut sink = Vec::new();
